@@ -28,25 +28,55 @@ jobs:
           set -euo pipefail
           git config user.name "NorthernAI Safe Sync"
           git config user.email "actions@users.noreply.github.com"
+
           default_branch="$(gh api "repos/${REPOSITORY}" --jq '.default_branch')"
+          base_sha="$(git rev-parse "${TRIGGER_SHA}^")"
           parent_repo="$(gh api "repos/${REPOSITORY}" --jq '.parent.full_name // empty')"
+
           if [[ -z "$parent_repo" ]]; then
-            echo "Not a fork; no sync performed." >> "$GITHUB_STEP_SUMMARY"
+            report_branch="sync-report/${RUN_DATE}"
+            git checkout -B "$report_branch" "$base_sha"
+            mkdir -p .github/sync-reports
+            report_path=".github/sync-reports/${RUN_DATE}.md"
+            {
+              echo "# Safe upstream sync report"
+              echo
+              echo "- Repository: ${REPOSITORY}"
+              echo "- Fork default branch: ${default_branch}"
+              echo "- Previous repository commit: ${base_sha}"
+              echo "- Result: not-a-fork"
+              echo
+              echo "This repository has no GitHub parent repository, so no upstream synchronization was attempted."
+            } > "$report_path"
+            git add "$report_path"
+            git commit -m "chore: record upstream sync eligibility (${RUN_DATE})"
+            git push --force origin "$report_branch"
+            git push --force-with-lease="refs/heads/${default_branch}:${TRIGGER_SHA}" origin "${base_sha}:refs/heads/${default_branch}"
+            {
+              echo "## Safe upstream sync"
+              echo "- Result: not-a-fork"
+              echo "- Default branch restored unchanged"
+              echo "- Report branch: ${report_branch}"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+
           upstream_branch="$(gh api "repos/${parent_repo}" --jq '.default_branch')"
           git remote add upstream "https://github.com/${parent_repo}.git" 2>/dev/null || git remote set-url upstream "https://github.com/${parent_repo}.git"
           git fetch --no-tags origin "$default_branch"
           git fetch --no-tags upstream "$upstream_branch"
-          base_sha="$(git rev-parse "${TRIGGER_SHA}^")"
           upstream_sha="$(git rev-parse "upstream/${upstream_branch}")"
           short_upstream="${upstream_sha:0:8}"
           changed="$(git diff --name-status "$base_sha" "$upstream_sha" || true)"
           deleted="$(printf '%s\n' "$changed" | awk '$1 ~ /^D/ {sub(/^[^[:space:]]+[[:space:]]+/, ""); print}' || true)"
           license_changes="$(printf '%s\n' "$changed" | awk 'BEGIN{IGNORECASE=1} {p=$NF; n=split(p,a,"/"); f=a[n]; if (f ~ /^(LICENSE|LICENSE\..*|COPYING|COPYING\..*|NOTICE|NOTICE\..*)$/) print}' || true)"
           upstream_log="$(git log --no-merges --pretty='- %h %s' "${base_sha}..${upstream_sha}" -n 12 || true)"
-          action=""; review_branch=""; ancestor="no"
+
+          action=""
+          review_branch=""
+          ancestor="no"
           git merge-base --is-ancestor "$base_sha" "$upstream_sha" && ancestor="yes" || true
+
           if [[ "$base_sha" == "$upstream_sha" ]]; then
             action="already-current"
           elif [[ "$ancestor" == "yes" && -z "$deleted" && -z "$license_changes" ]]; then
@@ -56,12 +86,14 @@ jobs:
             review_branch="upstream-review/${RUN_DATE}-${short_upstream}"
             git push --force origin "${upstream_sha}:refs/heads/${review_branch}"
           fi
+
           report_branch="sync-report/${RUN_DATE}"
           git checkout -B "$report_branch" "$base_sha"
           mkdir -p .github/sync-reports
           report_path=".github/sync-reports/${RUN_DATE}.md"
           {
-            echo "# Safe upstream sync report"; echo
+            echo "# Safe upstream sync report"
+            echo
             echo "- Repository: ${REPOSITORY}"
             echo "- Upstream: ${parent_repo}"
             echo "- Fork default branch: ${default_branch}"
@@ -70,18 +102,23 @@ jobs:
             echo "- Latest upstream commit: ${upstream_sha}"
             echo "- Result: ${action}"
             [[ -n "$review_branch" ]] && echo "- Review branch: ${review_branch}"
-            echo; echo "## Deleted paths"
+            echo
+            echo "## Deleted paths"
             if [[ -n "$deleted" ]]; then printf '%s\n' "$deleted" | sed 's/^/- `/' | sed 's/$/`/'; else echo "None."; fi
-            echo; echo "## Licence or notice changes"
+            echo
+            echo "## Licence or notice changes"
             if [[ -n "$license_changes" ]]; then printf '%s\n' "$license_changes" | sed 's/^/- `/' | sed 's/$/`/'; else echo "None."; fi
-            echo; echo "## Recent upstream changes"
+            echo
+            echo "## Recent upstream changes"
             if [[ -n "$upstream_log" ]]; then printf '%s\n' "$upstream_log"; else echo "No newer upstream commits."; fi
           } > "$report_path"
           git add "$report_path"
           git commit -m "chore: record safe upstream sync result (${RUN_DATE})"
           git push --force origin "$report_branch"
+
           if [[ "$action" == "fast-forwarded-default" ]]; then target="$upstream_sha"; else target="$base_sha"; fi
           git push --force-with-lease="refs/heads/${default_branch}:${TRIGGER_SHA}" origin "${target}:refs/heads/${default_branch}"
+
           {
             echo "## Safe upstream sync"
             echo "- Upstream: ${parent_repo} (${upstream_branch})"
